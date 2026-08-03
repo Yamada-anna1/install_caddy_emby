@@ -6,7 +6,7 @@
 #  V6 repository: https://github.com/Yamada-anna1/install_caddy_emby
 # ==============================================================
 
-VERSION="6.3.0"
+VERSION="6.4.0"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -171,6 +171,25 @@ collect_backends() {
     done
 
     ((${#BACKENDS[@]} > 0))
+}
+
+select_load_balance_policy() {
+    local policy_choice
+    LB_POLICY="first"
+    ((${#BACKENDS[@]} > 1)) || return 0
+
+    echo ""
+    echo -e "${SKYBLUE}请选择多后端工作模式：${PLAIN}"
+    echo " 1. 主备故障切换（推荐；始终优先第一个后端，避免 Emby 登录失效）"
+    echo " 2. 按客户端 IP 粘滞（不同客户端可分流，同一客户端固定后端）"
+    echo " 3. 轮询负载均衡（仅适合共享用户、令牌和媒体状态的后端）"
+    read -r -p "请选择 [1-3]（默认 1）: " policy_choice < /dev/tty
+
+    case "$policy_choice" in
+        2) LB_POLICY="client_ip_hash" ;;
+        3) LB_POLICY="round_robin" ;;
+        *) LB_POLICY="first" ;;
+    esac
 }
 
 check_port() {
@@ -368,9 +387,7 @@ write_site_block() {
         done
         printf ' {\n'
         if ((${#BACKENDS[@]} > 1)); then
-            # Emby 登录令牌通常只在签发它的后端有效。Cookie 粘滞可避免
-            # 登录请求和后续 API 请求被轮询到不同后端。
-            printf '        lb_policy cookie emby_backend %s\n' "$LB_COOKIE_SECRET"
+            printf '        lb_policy %s\n' "$LB_POLICY"
             printf '        lb_try_duration 5s\n'
             printf '        lb_try_interval 250ms\n'
             printf '        fail_duration 30s\n'
@@ -438,7 +455,7 @@ configure_caddy() {
     echo -e "${SKYBLUE}Caddy 反代配置（单域名支持任意数量后端）${PLAIN}"
     echo "------------------------------------------------"
 
-    local mode="new" config_mode domain candidate stripped machine_id
+    local mode="new" config_mode domain candidate stripped
     mkdir -p "$CADDY_DIR"
 
     if [[ -s "$CADDYFILE" ]]; then
@@ -458,10 +475,7 @@ configure_caddy() {
         return 1
     fi
     collect_backends || return 1
-
-    # 使用域名与机器 ID 生成稳定的 Cookie HMAC 密钥，重启/更新后粘滞会话仍有效。
-    machine_id="$(cat /etc/machine-id 2>/dev/null || hostname)"
-    LB_COOKIE_SECRET="$(printf '%s' "$domain:$machine_id:caddy-emby-v6" | sha256sum | awk '{print $1}')"
+    select_load_balance_policy
 
     candidate="$(mktemp "$CADDY_DIR/Caddyfile.new.XXXXXX")" || return 1
     if [[ "$mode" == "append" && -s "$CADDYFILE" ]]; then
