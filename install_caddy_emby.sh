@@ -6,7 +6,7 @@
 #  V6 repository: https://github.com/Yamada-anna1/install_caddy_emby
 # ==============================================================
 
-VERSION="6.4.0"
+VERSION="6.5.0"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -498,6 +498,144 @@ list_domains() {
     awk '/^[a-zA-Z0-9.-]+[[:space:]]*\{$/ { print $1 }' "$CADDYFILE"
 }
 
+extract_site_backends() {
+    local domain="$1" source="$2"
+    awk -v target="$domain" '
+        $0 == target " {" { in_site=1; next }
+        in_site && $1 == "reverse_proxy" {
+            for (i=2; i<=NF; i++) {
+                if ($i == "{") break
+                print $i
+            }
+            exit
+        }
+        in_site && $0 == "}" { exit }
+    ' "$source"
+}
+
+measure_backend_latency() {
+    local backend="$1" url elapsed attempt
+    local total_ms=0 success_count=0 current_ms
+
+    if [[ "$backend" == http://* || "$backend" == https://* ]]; then
+        url="$backend"
+    else
+        url="http://$backend"
+    fi
+
+    for attempt in 1 2; do
+        elapsed="$(curl -sS -o /dev/null --connect-timeout 3 --max-time 8 -w '%{time_total}' "$url" 2>/dev/null)" || continue
+        [[ "$elapsed" =~ ^[0-9]+([.][0-9]+)?$ ]] || continue
+        current_ms="$(awk -v seconds="$elapsed" 'BEGIN { printf "%d", seconds * 1000 }')"
+        total_ms=$((total_ms + current_ms))
+        ((success_count++))
+    done
+
+    if ((success_count == 0)); then
+        MEASURED_MS=-1
+        return 1
+    fi
+    MEASURED_MS=$((total_ms / success_count))
+}
+
+choose_fastest_backend() {
+    local backend index
+    local best_index=-1 best_ms=2147483647
+
+    echo -e "${SKYBLUE}正在从 Caddy 服务器测试各后端延迟（每条线路测试 2 次）...${PLAIN}"
+    for index in "${!CURRENT_BACKENDS[@]}"; do
+        backend="${CURRENT_BACKENDS[$index]}"
+        if measure_backend_latency "$backend"; then
+            printf ' %d. %-45s %d ms\n' "$((index + 1))" "$backend" "$MEASURED_MS"
+            if ((MEASURED_MS < best_ms)); then
+                best_ms="$MEASURED_MS"
+                best_index="$index"
+            fi
+        else
+            printf ' %d. %-45s 不可达\n' "$((index + 1))" "$backend"
+        fi
+    done
+
+    if ((best_index < 0)); then
+        error "所有后端均不可达，未执行切换。"
+        return 1
+    fi
+    SELECTED_BACKEND_INDEX="$best_index"
+    log "测速最快：${CURRENT_BACKENDS[$best_index]}（${best_ms} ms）"
+}
+
+switch_primary_backend() {
+    if [[ ! -s "$CADDYFILE" ]]; then
+        error "未找到有效配置文件"
+        return 1
+    fi
+
+    local domains=() input domain index candidate stripped backend
+    local selected_index
+    mapfile -t domains < <(list_domains)
+    if ((${#domains[@]} == 0)); then
+        warn "未找到域名配置"
+        return 1
+    fi
+
+    echo -e "${SKYBLUE}请选择要切换主备后端的域名：${PLAIN}"
+    for index in "${!domains[@]}"; do
+        printf ' %d. %s\n' "$((index + 1))" "${domains[$index]}"
+    done
+    read -r -p "请输入域名编号: " input < /dev/tty
+    [[ "$input" =~ ^[0-9]+$ ]] || { error "编号无效"; return 1; }
+    index=$((10#$input - 1))
+    ((index >= 0 && index < ${#domains[@]})) || { error "编号无效"; return 1; }
+    domain="${domains[$index]}"
+
+    CURRENT_BACKENDS=()
+    mapfile -t CURRENT_BACKENDS < <(extract_site_backends "$domain" "$CADDYFILE")
+    if ((${#CURRENT_BACKENDS[@]} < 2)); then
+        warn "域名 $domain 少于两个后端，无需主备切换。"
+        return 1
+    fi
+
+    echo ""
+    echo -e "${SKYBLUE}当前后端顺序（第一个为主服务器）：${PLAIN}"
+    for index in "${!CURRENT_BACKENDS[@]}"; do
+        if ((index == 0)); then
+            printf ' %d. %s  [当前主服务器]\n' "$((index + 1))" "${CURRENT_BACKENDS[$index]}"
+        else
+            printf ' %d. %s\n' "$((index + 1))" "${CURRENT_BACKENDS[$index]}"
+        fi
+    done
+    echo " 0. 自动测速并选择最快后端"
+    read -r -p "请选择新的主服务器编号 [0-${#CURRENT_BACKENDS[@]}]: " input < /dev/tty
+
+    if [[ "$input" == "0" ]]; then
+        choose_fastest_backend || return 1
+        selected_index="$SELECTED_BACKEND_INDEX"
+    elif [[ "$input" =~ ^[0-9]+$ ]]; then
+        selected_index=$((10#$input - 1))
+        ((selected_index >= 0 && selected_index < ${#CURRENT_BACKENDS[@]})) || { error "编号无效"; return 1; }
+    else
+        error "编号无效"
+        return 1
+    fi
+
+    BACKENDS=("${CURRENT_BACKENDS[$selected_index]}")
+    for index in "${!CURRENT_BACKENDS[@]}"; do
+        ((index == selected_index)) || BACKENDS+=("${CURRENT_BACKENDS[$index]}")
+    done
+    LB_POLICY="first"
+
+    candidate="$(mktemp "$CADDY_DIR/Caddyfile.new.XXXXXX")" || return 1
+    stripped="$(mktemp "$CADDY_DIR/Caddyfile.strip.XXXXXX")" || { rm -f -- "$candidate"; return 1; }
+    remove_site_block "$domain" "$CADDYFILE" "$stripped"
+    sed '/^[[:space:]]*$/d' "$stripped" > "$candidate"
+    rm -f -- "$stripped"
+    [[ -s "$candidate" ]] && printf '\n' >> "$candidate"
+    write_site_block "$domain" "$candidate"
+
+    log "正在把 ${BACKENDS[0]} 设为 $domain 的主服务器..."
+    install_candidate "$candidate" || rm -f -- "$candidate"
+}
+
 delete_config() {
     if [[ ! -s "$CADDYFILE" ]]; then
         error "未找到有效配置文件"
@@ -590,6 +728,7 @@ show_menu() {
     echo " 2. 添加/更新反代（一个域名可绑定多个后端）"
     echo " 3. 删除指定域名"
     echo " 4. 查看 Caddy 配置"
+    echo " 10. 主备服务器切换（手动 / 自动测速）"
     echo "------------------------------------------------------------"
     echo " 5. 停止 Caddy"
     echo " 6. 验证配置并重启 Caddy"
@@ -601,7 +740,7 @@ show_menu() {
     echo ""
 
     local num
-    read -r -p "请输入数字 [0-9]: " num < /dev/tty
+    read -r -p "请输入数字 [0-10]: " num < /dev/tty
     case "$num" in
         1) install_caddy ;;
         2) install_caddy && configure_caddy ;;
@@ -612,8 +751,9 @@ show_menu() {
         7) check_port ;;
         8) kill_port ;;
         9) uninstall_caddy ;;
+        10) switch_primary_backend ;;
         0) exit 0 ;;
-        *) error "请输入 0-9" ;;
+        *) error "请输入 0-10" ;;
     esac
 }
 
