@@ -12,6 +12,8 @@
 - 新配置导致启动失败时自动恢复上一份配置
 - 自动检查并修复缺失的 `caddy.service`
 - 启动失败时直接显示 systemd 日志和 80/443 端口占用，不再只显示“启动失败”
+- 端口清理同时处理 80/TCP、443/TCP 和 HTTP/3 使用的 443/UDP
+- 防止 nginx systemd 服务自动重启；若由 Docker/面板拉起，会显示进程和 cgroup 来源
 - 支持 HTTP、HTTPS、IPv4、域名和带方括号的 IPv6 后端
 
 ## 一键运行

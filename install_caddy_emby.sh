@@ -6,7 +6,7 @@
 #  V6 repository: https://github.com/Yamada-anna1/install_caddy_emby
 # ==============================================================
 
-VERSION="6.1.0"
+VERSION="6.2.0"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -217,14 +217,68 @@ show_caddy_failure_details() {
 }
 
 kill_port() {
-    echo -e "${RED}正在停止常见 Web 服务并清理端口...${PLAIN}"
-    systemctl stop nginx apache2 httpd 2>/dev/null || true
-    systemctl disable nginx apache2 httpd 2>/dev/null || true
-    if command -v fuser &>/dev/null; then
-        fuser -k 80/tcp 2>/dev/null || true
-        fuser -k 443/tcp 2>/dev/null || true
+    local confirm attempt pids pid cgroup_line
+    local services=(nginx openresty apache2 httpd)
+
+    echo -e "${RED}此操作会停止并屏蔽占用 Web 端口的 nginx/openresty/apache 服务。${PLAIN}"
+    read -r -p "确定继续？[y/N]: " confirm < /dev/tty
+    [[ "$confirm" =~ ^[Yy]$ ]] || { log "已取消"; return 0; }
+
+    echo -e "${RED}正在停止常见 Web 服务并清理 80/TCP、443/TCP、443/UDP...${PLAIN}"
+    for service in "${services[@]}"; do
+        if systemctl cat "$service.service" >/dev/null 2>&1; then
+            systemctl disable --now "$service.service" 2>/dev/null || true
+            systemctl mask "$service.service" 2>/dev/null || true
+        fi
+    done
+
+    # 连续处理三次，覆盖服务停止过程中短暂重建的 worker 进程。
+    for attempt in 1 2 3; do
+        if command -v fuser &>/dev/null; then
+            fuser -k 80/tcp 2>/dev/null || true
+            fuser -k 443/tcp 2>/dev/null || true
+            fuser -k 443/udp 2>/dev/null || true
+        fi
+        pkill -TERM -x nginx 2>/dev/null || true
+        pkill -TERM -x openresty 2>/dev/null || true
+        sleep 1
+    done
+    pkill -KILL -x nginx 2>/dev/null || true
+    pkill -KILL -x openresty 2>/dev/null || true
+    sleep 2
+
+    pids="$(pgrep -x nginx 2>/dev/null | paste -sd, -)"
+    if [[ -n "$pids" ]]; then
+        error "nginx 被其他程序自动重新拉起，端口尚未清理完成。"
+        echo -e "${SKYBLUE}[nginx 进程来源]${PLAIN}"
+        ps -o pid,ppid,user,comm,args -p "$pids" 2>/dev/null || true
+        echo ""
+        echo -e "${SKYBLUE}[进程所属 cgroup；包含 docker/containerd 时表示来自容器]${PLAIN}"
+        IFS=',' read -r -a nginx_pids <<< "$pids"
+        for pid in "${nginx_pids[@]}"; do
+            echo "PID $pid:"
+            while IFS= read -r cgroup_line; do
+                echo "  $cgroup_line"
+            done < "/proc/$pid/cgroup" 2>/dev/null || true
+        done
+        if command -v docker &>/dev/null; then
+            echo ""
+            echo -e "${SKYBLUE}[正在运行的 Docker 容器]${PLAIN}"
+            docker ps --no-trunc --format 'table {{.ID}}\t{{.Names}}\t{{.Ports}}' 2>/dev/null || true
+        fi
+        echo ""
+        warn "这通常是宝塔/1Panel/Docker 的守护功能。请把上面的“进程来源”和 cgroup 截图发来。"
+        return 1
     fi
-    log "清理完成"
+
+    if command -v ss &>/dev/null && ss -tulpn 2>/dev/null | grep -qE ':(80|443)([[:space:]]|$)'; then
+        error "仍有其他程序占用 80/443："
+        ss -tulpn 2>/dev/null | grep -E ':(80|443)([[:space:]]|$)' || true
+        return 1
+    fi
+
+    log "80/TCP、443/TCP、443/UDP 已全部释放。"
+    log "如需恢复 nginx，可运行：systemctl unmask nginx && systemctl enable --now nginx"
 }
 
 install_caddy() {
