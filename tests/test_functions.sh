@@ -31,11 +31,12 @@ tmp_dir="$(mktemp -d)"
 trap 'rm -rf -- "$tmp_dir"' EXIT
 
 BACKENDS=("10.0.0.1:8096" "10.0.0.2:8096" "10.0.0.3:8096")
+LB_COOKIE_SECRET="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 generated="$tmp_dir/generated.Caddyfile"
 : > "$generated"
 write_site_block "emby.example.com" "$generated"
 grep -Fq "reverse_proxy 10.0.0.1:8096 10.0.0.2:8096 10.0.0.3:8096" "$generated" || fail "backend list missing"
-grep -Fq "lb_policy round_robin" "$generated" || fail "load-balancing policy missing"
+grep -Fq "lb_policy cookie emby_backend $LB_COOKIE_SECRET" "$generated" || fail "sticky load-balancing policy missing"
 
 source_file="$tmp_dir/source.Caddyfile"
 remaining_file="$tmp_dir/remaining.Caddyfile"

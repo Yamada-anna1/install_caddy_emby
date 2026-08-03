@@ -6,7 +6,7 @@
 #  V6 repository: https://github.com/Yamada-anna1/install_caddy_emby
 # ==============================================================
 
-VERSION="6.2.0"
+VERSION="6.3.0"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -368,7 +368,9 @@ write_site_block() {
         done
         printf ' {\n'
         if ((${#BACKENDS[@]} > 1)); then
-            printf '        lb_policy round_robin\n'
+            # Emby 登录令牌通常只在签发它的后端有效。Cookie 粘滞可避免
+            # 登录请求和后续 API 请求被轮询到不同后端。
+            printf '        lb_policy cookie emby_backend %s\n' "$LB_COOKIE_SECRET"
             printf '        lb_try_duration 5s\n'
             printf '        lb_try_interval 250ms\n'
             printf '        fail_duration 30s\n'
@@ -376,7 +378,6 @@ write_site_block() {
             printf '        unhealthy_status 5xx\n'
         fi
         printf '        header_up X-Real-IP {remote_host}\n'
-        printf '        header_up Host {upstream_hostport}\n'
         printf '    }\n'
         printf '}\n'
     } >> "$destination"
@@ -437,7 +438,7 @@ configure_caddy() {
     echo -e "${SKYBLUE}Caddy 反代配置（单域名支持任意数量后端）${PLAIN}"
     echo "------------------------------------------------"
 
-    local mode="new" config_mode domain candidate stripped
+    local mode="new" config_mode domain candidate stripped machine_id
     mkdir -p "$CADDY_DIR"
 
     if [[ -s "$CADDYFILE" ]]; then
@@ -457,6 +458,10 @@ configure_caddy() {
         return 1
     fi
     collect_backends || return 1
+
+    # 使用域名与机器 ID 生成稳定的 Cookie HMAC 密钥，重启/更新后粘滞会话仍有效。
+    machine_id="$(cat /etc/machine-id 2>/dev/null || hostname)"
+    LB_COOKIE_SECRET="$(printf '%s' "$domain:$machine_id:caddy-emby-v6" | sha256sum | awk '{print $1}')"
 
     candidate="$(mktemp "$CADDY_DIR/Caddyfile.new.XXXXXX")" || return 1
     if [[ "$mode" == "append" && -s "$CADDYFILE" ]]; then
