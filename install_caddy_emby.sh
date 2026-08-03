@@ -6,7 +6,7 @@
 #  V6 repository: https://github.com/Yamada-anna1/install_caddy_emby
 # ==============================================================
 
-VERSION="6.0.0"
+VERSION="6.1.0"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -185,6 +185,37 @@ check_port() {
     echo "------------------------------------------------"
 }
 
+caddy_service_available() {
+    systemctl cat caddy.service >/dev/null 2>&1
+}
+
+show_caddy_failure_details() {
+    echo ""
+    echo -e "${YELLOW}================ Caddy 启动诊断 ================${PLAIN}"
+
+    if ! caddy_service_available; then
+        error "未找到 caddy.service。机器上可能只有 Caddy 可执行文件，没有 systemd 服务。"
+        echo "请重新运行菜单 1，脚本会补装/修复官方 Caddy 服务。"
+    else
+        echo -e "${SKYBLUE}[systemctl status]${PLAIN}"
+        systemctl status caddy --no-pager -l 2>&1 | tail -n 18 || true
+        echo ""
+        echo -e "${SKYBLUE}[最近的 Caddy 日志]${PLAIN}"
+        journalctl -u caddy --no-pager -n 25 2>/dev/null || true
+    fi
+
+    echo ""
+    echo -e "${SKYBLUE}[80/443 端口占用]${PLAIN}"
+    if command -v ss &>/dev/null; then
+        ss -tulpn 2>/dev/null | grep -E ':(80|443)([[:space:]]|$)' || echo "未发现监听程序"
+    elif command -v netstat &>/dev/null; then
+        netstat -tunlp 2>/dev/null | grep -E ':(80|443)([[:space:]]|$)' || echo "未发现监听程序"
+    fi
+    echo ""
+    warn "如果端口被 nginx、apache、httpd 或其他程序占用，请返回主菜单选择 8 后重试。"
+    echo -e "${YELLOW}=================================================${PLAIN}"
+}
+
 kill_port() {
     echo -e "${RED}正在停止常见 Web 服务并清理端口...${PLAIN}"
     systemctl stop nginx apache2 httpd 2>/dev/null || true
@@ -197,29 +228,46 @@ kill_port() {
 }
 
 install_caddy() {
-    if command -v caddy &>/dev/null; then
-        warn "Caddy 已安装。"
+    if command -v caddy &>/dev/null && caddy_service_available; then
+        systemctl unmask caddy >/dev/null 2>&1 || true
+        systemctl enable caddy >/dev/null 2>&1 || true
+        log "Caddy 和 systemd 服务均已安装。"
         return 0
     fi
 
     install_base || return 1
-    log "正在安装 Caddy..."
+    if command -v caddy &>/dev/null; then
+        warn "检测到 Caddy 命令，但缺少 caddy.service，正在修复官方安装。"
+    else
+        log "正在安装 Caddy..."
+    fi
     if [[ -f /etc/debian_version ]]; then
         apt-get install -y debian-keyring debian-archive-keyring apt-transport-https
         curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
         curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
-        apt-get update -y && apt-get install -y caddy
+        apt-get update -y
+        if dpkg -s caddy &>/dev/null; then
+            apt-get install --reinstall -y caddy
+        else
+            apt-get install -y caddy
+        fi
     elif [[ -f /etc/redhat-release ]]; then
         yum install -y yum-plugin-copr
         yum copr enable -y @caddyserver/caddy
-        yum install -y caddy
+        if rpm -q caddy &>/dev/null; then
+            yum reinstall -y caddy
+        else
+            yum install -y caddy
+        fi
     fi
 
-    if command -v caddy &>/dev/null; then
+    systemctl daemon-reload
+    systemctl unmask caddy >/dev/null 2>&1 || true
+    if command -v caddy &>/dev/null && caddy_service_available; then
         systemctl enable caddy
-        log "Caddy 安装完成"
+        log "Caddy 和 systemd 服务安装完成"
     else
-        error "Caddy 安装失败"
+        error "Caddy 安装不完整：未找到 caddy 命令或 caddy.service"
         return 1
     fi
 }
@@ -297,20 +345,35 @@ install_candidate() {
         return 1
     fi
 
+    if ! caddy_service_available; then
+        error "未找到 caddy.service，无法启动。请先选择菜单 1 修复安装。"
+        return 1
+    fi
+
     backup_caddyfile
     install -m 0644 "$candidate" "$CADDYFILE"
     rm -f -- "$candidate"
 
+    systemctl daemon-reload
+    systemctl reset-failed caddy >/dev/null 2>&1 || true
     log "配置验证通过，正在重启 Caddy..."
     if systemctl restart caddy && systemctl is-active --quiet caddy; then
         echo -e "${GREEN}配置成功，Caddy 正在运行。${PLAIN}"
         return 0
     fi
 
-    error "Caddy 启动失败，正在恢复上一份配置。"
+    error "Caddy 启动失败。以下是本次失败的真实诊断信息："
+    show_caddy_failure_details
+    error "正在恢复上一份配置。"
     if [[ -n "$LAST_BACKUP" && -f "$LAST_BACKUP" ]]; then
         cp "$LAST_BACKUP" "$CADDYFILE"
-        systemctl restart caddy 2>/dev/null || true
+        if systemctl restart caddy 2>/dev/null; then
+            log "已恢复上一份配置。"
+        else
+            error "旧配置也无法启动，请根据上面的端口/服务日志处理。"
+        fi
+    else
+        warn "这是第一份配置，没有可恢复的旧配置；失败配置仍保留在 $CADDYFILE。"
     fi
     return 1
 }
@@ -416,11 +479,18 @@ restart_caddy() {
         error "配置验证失败，未重启 Caddy。"
         return 1
     fi
+    if ! caddy_service_available; then
+        error "未找到 caddy.service，请先选择菜单 1 修复安装。"
+        return 1
+    fi
+    systemctl daemon-reload
+    systemctl reset-failed caddy >/dev/null 2>&1 || true
     systemctl restart caddy
     if systemctl is-active --quiet caddy; then
         log "Caddy 正在运行"
     else
-        error "Caddy 启动失败，请运行：systemctl status caddy -l"
+        error "Caddy 启动失败"
+        show_caddy_failure_details
         return 1
     fi
 }
@@ -461,7 +531,7 @@ show_menu() {
     read -r -p "请输入数字 [0-9]: " num < /dev/tty
     case "$num" in
         1) install_caddy ;;
-        2) install_base && configure_caddy ;;
+        2) install_caddy && configure_caddy ;;
         3) delete_config ;;
         4) [[ -f "$CADDYFILE" ]] && cat "$CADDYFILE" || warn "配置文件不存在" ;;
         5) systemctl stop caddy && log "Caddy 已停止" ;;
