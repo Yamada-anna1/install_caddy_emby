@@ -56,9 +56,4 @@ remove_site_block "first.example.com" "$source_file" "$remaining_file"
 ! grep -Fq "first.example.com" "$remaining_file" || fail "target site was not removed"
 grep -Fq "second.example.com" "$remaining_file" || fail "unrelated site was removed"
 
-mapfile -t extracted_backends < <(extract_site_backends "first.example.com" "$source_file")
-[[ "${#extracted_backends[@]}" == "2" ]] || fail "backend extraction count"
-[[ "${extracted_backends[0]}" == "10.0.0.1:8096" ]] || fail "first backend extraction"
-[[ "${extracted_backends[1]}" == "10.0.0.2:8096" ]] || fail "second backend extraction"
-
 echo "All function tests passed."

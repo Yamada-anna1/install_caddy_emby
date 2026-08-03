@@ -6,7 +6,7 @@
 #  V6 repository: https://github.com/Yamada-anna1/install_caddy_emby
 # ==============================================================
 
-VERSION="6.5.0"
+VERSION="6.7.0"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -171,25 +171,6 @@ collect_backends() {
     done
 
     ((${#BACKENDS[@]} > 0))
-}
-
-select_load_balance_policy() {
-    local policy_choice
-    LB_POLICY="first"
-    ((${#BACKENDS[@]} > 1)) || return 0
-
-    echo ""
-    echo -e "${SKYBLUE}请选择多后端工作模式：${PLAIN}"
-    echo " 1. 主备故障切换（推荐；始终优先第一个后端，避免 Emby 登录失效）"
-    echo " 2. 按客户端 IP 粘滞（不同客户端可分流，同一客户端固定后端）"
-    echo " 3. 轮询负载均衡（仅适合共享用户、令牌和媒体状态的后端）"
-    read -r -p "请选择 [1-3]（默认 1）: " policy_choice < /dev/tty
-
-    case "$policy_choice" in
-        2) LB_POLICY="client_ip_hash" ;;
-        3) LB_POLICY="round_robin" ;;
-        *) LB_POLICY="first" ;;
-    esac
 }
 
 check_port() {
@@ -450,12 +431,12 @@ install_candidate() {
     return 1
 }
 
-configure_caddy() {
+configure_single_emby() {
     echo "------------------------------------------------"
-    echo -e "${SKYBLUE}Caddy 反代配置（单域名支持任意数量后端）${PLAIN}"
+    echo -e "${SKYBLUE}添加/更新独立 Emby（一个域名对应一个后端）${PLAIN}"
     echo "------------------------------------------------"
 
-    local mode="new" config_mode domain candidate stripped
+    local mode="new" config_mode domain candidate stripped backend_input
     mkdir -p "$CADDY_DIR"
 
     if [[ -s "$CADDYFILE" ]]; then
@@ -474,8 +455,15 @@ configure_caddy() {
         error "域名格式无效"
         return 1
     fi
-    collect_backends || return 1
-    select_load_balance_policy
+
+    read -r -p "请输入该 Emby 的后端地址（留空默认 127.0.0.1:8096）: " backend_input < /dev/tty
+    [[ -z "$backend_input" ]] && backend_input="127.0.0.1:8096"
+    if ! normalize_backend "$backend_input"; then
+        error "后端地址无效。示例：127.0.0.1:8096 或 https://emby.example.com:443"
+        return 1
+    fi
+    BACKENDS=("$NORMALIZED_BACKEND")
+    LB_POLICY="first"
 
     candidate="$(mktemp "$CADDY_DIR/Caddyfile.new.XXXXXX")" || return 1
     if [[ "$mode" == "append" && -s "$CADDYFILE" ]]; then
@@ -489,7 +477,7 @@ configure_caddy() {
 
     echo ""
     log "域名：$domain"
-    log "后端数量：${#BACKENDS[@]}"
+    log "独立 Emby 后端：${BACKENDS[0]}"
     install_candidate "$candidate" || rm -f -- "$candidate"
 }
 
@@ -498,141 +486,54 @@ list_domains() {
     awk '/^[a-zA-Z0-9.-]+[[:space:]]*\{$/ { print $1 }' "$CADDYFILE"
 }
 
-extract_site_backends() {
-    local domain="$1" source="$2"
-    awk -v target="$domain" '
-        $0 == target " {" { in_site=1; next }
-        in_site && $1 == "reverse_proxy" {
-            for (i=2; i<=NF; i++) {
-                if ($i == "{") break
-                print $i
-            }
-            exit
-        }
-        in_site && $0 == "}" { exit }
-    ' "$source"
-}
+configure_failover_emby() {
+    echo "------------------------------------------------"
+    echo -e "${SKYBLUE}添加/更新主备 Emby（一个域名对应同一 Emby 的多条线路）${PLAIN}"
+    echo "------------------------------------------------"
 
-measure_backend_latency() {
-    local backend="$1" url elapsed attempt
-    local total_ms=0 success_count=0 current_ms
+    local mode="new" config_mode domain candidate stripped
+    mkdir -p "$CADDY_DIR"
 
-    if [[ "$backend" == http://* || "$backend" == https://* ]]; then
-        url="$backend"
-    else
-        url="http://$backend"
-    fi
-
-    for attempt in 1 2; do
-        elapsed="$(curl -sS -o /dev/null --connect-timeout 3 --max-time 8 -w '%{time_total}' "$url" 2>/dev/null)" || continue
-        [[ "$elapsed" =~ ^[0-9]+([.][0-9]+)?$ ]] || continue
-        current_ms="$(awk -v seconds="$elapsed" 'BEGIN { printf "%d", seconds * 1000 }')"
-        total_ms=$((total_ms + current_ms))
-        ((success_count++))
-    done
-
-    if ((success_count == 0)); then
-        MEASURED_MS=-1
-        return 1
-    fi
-    MEASURED_MS=$((total_ms / success_count))
-}
-
-choose_fastest_backend() {
-    local backend index
-    local best_index=-1 best_ms=2147483647
-
-    echo -e "${SKYBLUE}正在从 Caddy 服务器测试各后端延迟（每条线路测试 2 次）...${PLAIN}"
-    for index in "${!CURRENT_BACKENDS[@]}"; do
-        backend="${CURRENT_BACKENDS[$index]}"
-        if measure_backend_latency "$backend"; then
-            printf ' %d. %-45s %d ms\n' "$((index + 1))" "$backend" "$MEASURED_MS"
-            if ((MEASURED_MS < best_ms)); then
-                best_ms="$MEASURED_MS"
-                best_index="$index"
-            fi
+    if [[ -s "$CADDYFILE" ]]; then
+        echo " 1. 覆盖全部配置"
+        echo " 2. 添加新域名 / 更新已有域名"
+        read -r -p "请选择模式 [1-2]（默认 2）: " config_mode < /dev/tty
+        if [[ "$config_mode" == "1" ]]; then
+            mode="new"
         else
-            printf ' %d. %-45s 不可达\n' "$((index + 1))" "$backend"
+            mode="append"
         fi
-    done
-
-    if ((best_index < 0)); then
-        error "所有后端均不可达，未执行切换。"
-        return 1
     fi
-    SELECTED_BACKEND_INDEX="$best_index"
-    log "测速最快：${CURRENT_BACKENDS[$best_index]}（${best_ms} ms）"
-}
 
-switch_primary_backend() {
-    if [[ ! -s "$CADDYFILE" ]]; then
-        error "未找到有效配置文件"
+    read -r -p "请输入主备 Emby 使用的域名（例如 emby.example.com）: " domain < /dev/tty
+    if ! validate_domain "$domain"; then
+        error "域名格式无效"
         return 1
     fi
 
-    local domains=() input domain index candidate stripped backend
-    local selected_index
-    mapfile -t domains < <(list_domains)
-    if ((${#domains[@]} == 0)); then
-        warn "未找到域名配置"
+    echo "请先输入主服务器地址，再依次输入备用服务器地址。"
+    collect_backends || return 1
+    if ((${#BACKENDS[@]} < 2)); then
+        error "主备 Emby 至少需要 2 个后端：1 个主服务器和 1 个备用服务器。"
         return 1
     fi
-
-    echo -e "${SKYBLUE}请选择要切换主备后端的域名：${PLAIN}"
-    for index in "${!domains[@]}"; do
-        printf ' %d. %s\n' "$((index + 1))" "${domains[$index]}"
-    done
-    read -r -p "请输入域名编号: " input < /dev/tty
-    [[ "$input" =~ ^[0-9]+$ ]] || { error "编号无效"; return 1; }
-    index=$((10#$input - 1))
-    ((index >= 0 && index < ${#domains[@]})) || { error "编号无效"; return 1; }
-    domain="${domains[$index]}"
-
-    CURRENT_BACKENDS=()
-    mapfile -t CURRENT_BACKENDS < <(extract_site_backends "$domain" "$CADDYFILE")
-    if ((${#CURRENT_BACKENDS[@]} < 2)); then
-        warn "域名 $domain 少于两个后端，无需主备切换。"
-        return 1
-    fi
-
-    echo ""
-    echo -e "${SKYBLUE}当前后端顺序（第一个为主服务器）：${PLAIN}"
-    for index in "${!CURRENT_BACKENDS[@]}"; do
-        if ((index == 0)); then
-            printf ' %d. %s  [当前主服务器]\n' "$((index + 1))" "${CURRENT_BACKENDS[$index]}"
-        else
-            printf ' %d. %s\n' "$((index + 1))" "${CURRENT_BACKENDS[$index]}"
-        fi
-    done
-    echo " 0. 自动测速并选择最快后端"
-    read -r -p "请选择新的主服务器编号 [0-${#CURRENT_BACKENDS[@]}]: " input < /dev/tty
-
-    if [[ "$input" == "0" ]]; then
-        choose_fastest_backend || return 1
-        selected_index="$SELECTED_BACKEND_INDEX"
-    elif [[ "$input" =~ ^[0-9]+$ ]]; then
-        selected_index=$((10#$input - 1))
-        ((selected_index >= 0 && selected_index < ${#CURRENT_BACKENDS[@]})) || { error "编号无效"; return 1; }
-    else
-        error "编号无效"
-        return 1
-    fi
-
-    BACKENDS=("${CURRENT_BACKENDS[$selected_index]}")
-    for index in "${!CURRENT_BACKENDS[@]}"; do
-        ((index == selected_index)) || BACKENDS+=("${CURRENT_BACKENDS[$index]}")
-    done
     LB_POLICY="first"
 
     candidate="$(mktemp "$CADDY_DIR/Caddyfile.new.XXXXXX")" || return 1
-    stripped="$(mktemp "$CADDY_DIR/Caddyfile.strip.XXXXXX")" || { rm -f -- "$candidate"; return 1; }
-    remove_site_block "$domain" "$CADDYFILE" "$stripped"
-    sed '/^[[:space:]]*$/d' "$stripped" > "$candidate"
-    rm -f -- "$stripped"
-    [[ -s "$candidate" ]] && printf '\n' >> "$candidate"
+    if [[ "$mode" == "append" && -s "$CADDYFILE" ]]; then
+        stripped="$(mktemp "$CADDY_DIR/Caddyfile.strip.XXXXXX")" || return 1
+        remove_site_block "$domain" "$CADDYFILE" "$stripped"
+        sed '/^[[:space:]]*$/d' "$stripped" > "$candidate"
+        rm -f -- "$stripped"
+        [[ -s "$candidate" ]] && printf '\n' >> "$candidate"
+    fi
     write_site_block "$domain" "$candidate"
 
-    log "正在把 ${BACKENDS[0]} 设为 $domain 的主服务器..."
+    echo ""
+    log "域名：$domain"
+    log "主服务器：${BACKENDS[0]}"
+    log "备用服务器数量：$((${#BACKENDS[@]} - 1))"
+    log "自动规则：主服务器连接失败或连续出现 5xx 时临时使用备用服务器；主服务器恢复后自动重新优先。"
     install_candidate "$candidate" || rm -f -- "$candidate"
 }
 
@@ -721,21 +622,21 @@ uninstall_caddy() {
 
 show_menu() {
     clear
-    echo "############################################################"
-    echo "#  Caddy + Emby 管理脚本 V${VERSION}（多后端负载均衡版）   #"
-    echo "############################################################"
+    echo "##############################################################"
+    echo "#   Caddy + Emby 管理脚本 V${VERSION}（多后端主备管理版）   #"
+    echo "##############################################################"
     echo " 1. 安装环境和 Caddy"
-    echo " 2. 添加/更新反代（一个域名可绑定多个后端）"
+    echo " 2. 添加/更新独立 Emby（一个域名一个后端）"
     echo " 3. 删除指定域名"
     echo " 4. 查看 Caddy 配置"
-    echo " 10. 主备服务器切换（手动 / 自动测速）"
-    echo "------------------------------------------------------------"
-    echo " 5. 停止 Caddy"
-    echo " 6. 验证配置并重启 Caddy"
-    echo " 7. 查询 80/443 端口占用"
-    echo -e " ${RED}8. 停止占用端口的常见 Web 服务${PLAIN}"
-    echo -e " ${RED}9. 卸载 Caddy${PLAIN}"
-    echo "------------------------------------------------------------"
+    echo " 5. 添加/更新主备 Emby（一个域名多个后端）"
+    echo "--------------------------------------------------------------"
+    echo " 6. 停止 Caddy"
+    echo " 7. 验证配置并重启 Caddy"
+    echo " 8. 查询 80/443 端口占用"
+    echo -e " ${RED}9. 停止占用端口的常见 Web 服务${PLAIN}"
+    echo -e "${RED}10. 卸载 Caddy${PLAIN}"
+    echo "--------------------------------------------------------------"
     echo " 0. 退出"
     echo ""
 
@@ -743,15 +644,15 @@ show_menu() {
     read -r -p "请输入数字 [0-10]: " num < /dev/tty
     case "$num" in
         1) install_caddy ;;
-        2) install_caddy && configure_caddy ;;
+        2) install_caddy && configure_single_emby ;;
         3) delete_config ;;
         4) [[ -f "$CADDYFILE" ]] && cat "$CADDYFILE" || warn "配置文件不存在" ;;
-        5) systemctl stop caddy && log "Caddy 已停止" ;;
-        6) restart_caddy ;;
-        7) check_port ;;
-        8) kill_port ;;
-        9) uninstall_caddy ;;
-        10) switch_primary_backend ;;
+        5) install_caddy && configure_failover_emby ;;
+        6) systemctl stop caddy && log "Caddy 已停止" ;;
+        7) restart_caddy ;;
+        8) check_port ;;
+        9) kill_port ;;
+        10) uninstall_caddy ;;
         0) exit 0 ;;
         *) error "请输入 0-10" ;;
     esac
