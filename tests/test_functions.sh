@@ -32,11 +32,15 @@ trap 'rm -rf -- "$tmp_dir"' EXIT
 
 BACKENDS=("10.0.0.1:8096" "10.0.0.2:8096" "10.0.0.3:8096")
 LB_POLICY="first"
+SMART_FAILOVER="true"
 generated="$tmp_dir/generated.Caddyfile"
 : > "$generated"
 write_site_block "emby.example.com" "$generated"
 grep -Fq "reverse_proxy 10.0.0.1:8096 10.0.0.2:8096 10.0.0.3:8096" "$generated" || fail "backend list missing"
 grep -Fq "lb_policy first" "$generated" || fail "primary/failover policy missing"
+grep -Fq "health_uri /System/Info/Public" "$generated" || fail "smart health URI missing"
+grep -Fq "health_timeout 3s" "$generated" || fail "smart health timeout missing"
+grep -Fq "health_fails 2" "$generated" || fail "smart health failure threshold missing"
 
 source_file="$tmp_dir/source.Caddyfile"
 remaining_file="$tmp_dir/remaining.Caddyfile"

@@ -6,7 +6,7 @@
 #  V6 repository: https://github.com/Yamada-anna1/install_caddy_emby
 # ==============================================================
 
-VERSION="6.7.0"
+VERSION="6.8.0"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -374,6 +374,16 @@ write_site_block() {
             printf '        fail_duration 30s\n'
             printf '        max_fails 2\n'
             printf '        unhealthy_status 5xx\n'
+            if [[ "${SMART_FAILOVER:-false}" == "true" ]]; then
+                # 使用 Emby 的轻量公开接口做主动健康检查，避免把长时间视频流
+                # 误判为后端响应过慢。
+                printf '        health_uri /System/Info/Public\n'
+                printf '        health_interval 10s\n'
+                printf '        health_timeout 3s\n'
+                printf '        health_status 2xx\n'
+                printf '        health_fails 2\n'
+                printf '        health_passes 2\n'
+            fi
         fi
         printf '        header_up X-Real-IP {remote_host}\n'
         printf '    }\n'
@@ -464,6 +474,7 @@ configure_single_emby() {
     fi
     BACKENDS=("$NORMALIZED_BACKEND")
     LB_POLICY="first"
+    SMART_FAILOVER="false"
 
     candidate="$(mktemp "$CADDY_DIR/Caddyfile.new.XXXXXX")" || return 1
     if [[ "$mode" == "append" && -s "$CADDYFILE" ]]; then
@@ -488,7 +499,7 @@ list_domains() {
 
 configure_failover_emby() {
     echo "------------------------------------------------"
-    echo -e "${SKYBLUE}添加/更新主备 Emby（一个域名对应同一 Emby 的多条线路）${PLAIN}"
+    echo -e "${SKYBLUE}添加/更新智能主备 Emby（一个域名对应同一 Emby 的多条线路）${PLAIN}"
     echo "------------------------------------------------"
 
     local mode="new" config_mode domain candidate stripped
@@ -518,6 +529,7 @@ configure_failover_emby() {
         return 1
     fi
     LB_POLICY="first"
+    SMART_FAILOVER="true"
 
     candidate="$(mktemp "$CADDY_DIR/Caddyfile.new.XXXXXX")" || return 1
     if [[ "$mode" == "append" && -s "$CADDYFILE" ]]; then
@@ -533,7 +545,8 @@ configure_failover_emby() {
     log "域名：$domain"
     log "主服务器：${BACKENDS[0]}"
     log "备用服务器数量：$((${#BACKENDS[@]} - 1))"
-    log "自动规则：主服务器连接失败或连续出现 5xx 时临时使用备用服务器；主服务器恢复后自动重新优先。"
+    log "智能检查：每 10 秒检测一次，单次超时 3 秒。"
+    log "自动规则：连续 2 次连接失败、5xx 或健康检查失败时切换备用；连续 2 次恢复后自动重新优先主服务器。"
     install_candidate "$candidate" || rm -f -- "$candidate"
 }
 
@@ -629,7 +642,7 @@ show_menu() {
     echo " 2. 添加/更新独立 Emby（一个域名一个后端）"
     echo " 3. 删除指定域名"
     echo " 4. 查看 Caddy 配置"
-    echo " 5. 添加/更新主备 Emby（一个域名多个后端）"
+    echo " 5. 添加/更新智能主备 Emby（一个域名多个后端）"
     echo "--------------------------------------------------------------"
     echo " 6. 停止 Caddy"
     echo " 7. 验证配置并重启 Caddy"

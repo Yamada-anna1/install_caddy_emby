@@ -6,8 +6,9 @@
 
 - 独立 Emby 与主备 Emby 使用两个清晰、互不混淆的菜单入口
 - 独立 Emby：一个域名绑定一个后端，可继续添加多个不同的 Emby 域名
-- 主备 Emby：一个域名绑定同一 Emby 的任意数量线路，第一个后端为主服务器，其余为备用服务器
-- 主服务器连接失败或连续返回 5xx 时临时使用备用服务器，主服务器恢复后自动重新优先使用
+- 智能主备 Emby：一个域名绑定同一 Emby 的任意数量线路，第一个后端为主服务器，其余为备用服务器
+- 每 10 秒通过 Emby 轻量公开接口进行健康检查；连续 2 次连接失败、5xx、超时或检查异常时切换备用服务器
+- 主服务器连续 2 次检查恢复正常后，自动重新优先使用主服务器
 - 后端连续失败时自动临时摘除，并尝试其他可用后端
 - 支持添加新域名，或更新已有域名的全部后端
 - 写入前执行 Caddy 格式化和配置验证
@@ -30,7 +31,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Yamada-anna1/install_caddy_e
 c
 ```
 
-## 添加主备 Emby
+## 添加智能主备 Emby
 
 在菜单选择 `5`，输入域名后先输入主服务器，再逐个输入备用服务器：
 
@@ -55,6 +56,12 @@ emby.example.com {
         fail_duration 30s
         max_fails 2
         unhealthy_status 5xx
+        health_uri /System/Info/Public
+        health_interval 10s
+        health_timeout 3s
+        health_status 2xx
+        health_fails 2
+        health_passes 2
         header_up X-Real-IP {remote_host}
     }
 }
@@ -66,7 +73,7 @@ emby.example.com {
 - 把已有域名改成主备模式后，客户端若缓存了旧登录令牌，请退出登录或删除该服务器后重新添加一次。
 - 完全独立的 Emby 应分别使用菜单 `2` 配置不同域名；菜单 `5` 只用于同一个 Emby 的主线路和备用线路。
 - HTTPS 后端请明确写成 `https://主机名:端口`。
-- 主备后端用于故障切换，不会轮询分流；正常情况下所有请求都使用第一个后端。
+- 智能主备后端用于健康检查和故障切换，不会轮询分流；正常情况下所有请求都使用第一个后端。
 - 使用前请确保域名已解析到运行 Caddy 的服务器，并开放 TCP 80/443 端口。
 
 ## 来源说明
